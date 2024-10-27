@@ -3,6 +3,8 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 
+import struct
+
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -23,13 +25,27 @@ class Streamer:
 
         for i in range(0, len(data_bytes), chunk_size):
             chunk = data_bytes[i: i + chunk_size]
+            header = struct.pack("l", i) #8B
+            chunk = header + chunk
+
             self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
 
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         # your code goes here!  The code below should be changed!
-        
+
+        # recv buffer
+        # current seq #
+        # if recv buffer[0].seq# match expected seq#
+            # recvfrom it, return it
+        #else
+            # for p in recvbuffer
+            # if p.seq# match expected seq#
+                # recv from it, return it
+
+
+
         # this sample code just calls the recvfrom method on the LossySocket
         data, addr = self.socket.recvfrom()
         # For now, I'll just pass the full UDP payload to the app
