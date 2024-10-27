@@ -18,8 +18,13 @@ class Streamer:
         """Note that data_bytes can be larger than one packet."""
         # Your code goes here!  The code below should be changed!
 
-        # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+        # making the chunks 1024 bytes
+        chunk_size = 1024
+
+        for i in range(0, len(data_bytes), chunk_size):
+            chunk = data_bytes[i: i + chunk_size]
+            self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
+
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
