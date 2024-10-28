@@ -15,6 +15,9 @@ class Streamer:
         self.socket.bind((src_ip, src_port))
         self.dst_ip = dst_ip
         self.dst_port = dst_port
+        self.sequence_number = 0 # keep track of the sequence numbers
+        self.expected_sequence = 0 # keep track of sequence of received
+        self.recv_buffer = {} # buffer for out of order
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -25,34 +28,40 @@ class Streamer:
 
         for i in range(0, len(data_bytes), chunk_size):
             chunk = data_bytes[i: i + chunk_size]
-            header = struct.pack("l", i) #8B
+            header = struct.pack("Q", self.sequence_number) #8B unsigned long long
             chunk = header + chunk
 
             self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
+            self.sequence_number += 1
 
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         # your code goes here!  The code below should be changed!
 
-        # recv buffer
-        # current seq #
-        # if recv buffer[0].seq# match expected seq#
-            # recvfrom it, return it
-        #else
-            # for p in recvbuffer
-            # if p.seq# match expected seq#
-                # recv from it, return it
+        while True:
+            received, _ = self.socket.recvfrom()
 
+            # get sequence number (header is first 8 bytes)
+            seq_num = struct.unpack("Q", received[:8])[0]
+            data = received[8:]
 
+            if seq_num == self.expected_sequence:
+                self.expected_sequence += 1
 
-        # this sample code just calls the recvfrom method on the LossySocket
-        data, addr = self.socket.recvfrom()
-        # For now, I'll just pass the full UDP payload to the app
-        return data
+                # check if subsequent packets are in buffer
+                while self.expected_sequence in self.recv_buffer:
+                    data += self.recv_buffer.pop(self.expected_sequence)
+                    self.expected_sequence += 1
+
+                return data
+
+            elif seq_num > self.expected_sequence:
+                self.recv_buffer[seq_num] = data
+
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        pass
+        self.socket.stoprecv()
