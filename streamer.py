@@ -6,6 +6,7 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 
 import struct
+import time
 
 
 class Streamer:
@@ -23,18 +24,28 @@ class Streamer:
         self.closed = False # if listener should stop
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.executor.submit(self.listener)
+        self.ack_received = False
 
     def listener(self):
         while not self.closed:
             try:
                 received, _ = self.socket.recvfrom()
 
-                # store data in the receive buffer
-                seq_num = struct.unpack("Q", received[:8])[0]
-                data = received[8:]
+                # note that first byte is ACK flag
+                ack_flag = received[0]
+                print("ACK flag:", ack_flag)
+                seq_num = struct.unpack("Q", received[1:9])[0]
+                data = received[9:]
 
-                if seq_num >= self.expected_sequence:
-                    self.recv_buffer[seq_num] = data
+                # if it's an ack, check if it matches with the previous sent seq number
+                if ack_flag == 1:
+                    if seq_num == self.sequence_number - 1:
+                        self.ack_received = True
+
+                # otherwise, it's data so add to buffer
+                else:
+                    if seq_num >= self.expected_sequence:
+                        self.recv_buffer[seq_num] = data
 
             except Exception as e:
                 print("listener died!")
@@ -49,10 +60,18 @@ class Streamer:
 
         for i in range(0, len(data_bytes), chunk_size):
             chunk = data_bytes[i: i + chunk_size]
-            header = struct.pack("Q", self.sequence_number) #8B unsigned long long
-            chunk = header + chunk
 
-            self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
+            # add a flag to denote ACK: 1 for yes
+            header = struct.pack("BQ", 0, self.sequence_number) #Byte for ACK flag + 8B unsigned long long
+            packet = header + chunk
+
+            self.ack_received = False
+
+            while not self.ack_received:
+                # keep trying to send
+                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                time.sleep(0.01)
+
             self.sequence_number += 1
 
 
