@@ -29,7 +29,7 @@ class Streamer:
     def listener(self):
         while not self.closed:
             try:
-                received, _ = self.socket.recvfrom()
+                received, addr = self.socket.recvfrom()
 
                 # catch really busted packets
                 if len(received) < 9:
@@ -38,9 +38,10 @@ class Streamer:
 
                 # note that first byte is ACK flag
                 ack_flag = received[0]
-                # print("ACK flag:", ack_flag)
+                # print("ACK flag type:", type(ack_flag))
                 seq_num = struct.unpack("Q", received[1:9])[0]
-                data = received[9:]
+                data = received[9:].strip(b'\x00')
+                # print("listener data:", data)
 
                 # if it's an ack, check if it matches with the previous sent seq number
                 if ack_flag == 1:
@@ -49,8 +50,17 @@ class Streamer:
 
                 # otherwise, it's data so add to buffer
                 else:
+                    print("the received thing is data, not an ack")
+                    print("sequence number received:", seq_num)
+                    print("expected sequence number:", self.expected_sequence)
+                    print("self.sequence num:", self.sequence_number)
                     if seq_num >= self.expected_sequence:
                         self.recv_buffer[seq_num] = data
+
+                        # send ACK
+                        ack_packet = struct.pack("BQ", 1, seq_num)
+                        print("ack_packet", ack_packet)
+                        self.socket.sendto(ack_packet, addr)
 
             except Exception as e:
                 print("Listener died 'cause of this! ", e)
@@ -68,19 +78,21 @@ class Streamer:
 
             # add a flag to denote ACK: 1 for yes
             header = struct.pack("BQ", 0, self.sequence_number) #Byte for ACK flag + 8B unsigned long long
-            packet = header + chunk
+            packet = header + chunk.strip(b'\x00')
             retry_count = 0
             max_retries = 10
             self.ack_received = False
 
             while not self.ack_received and retry_count < max_retries:
                 # keep trying to send
+                print("retrying sending packet (waiting for ACK)")
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                time.sleep(0.01)
+                time.sleep(0.25)
                 retry_count += 1
 
             if not self.ack_received:
                 print("Failed to receive ACK for packet # ", self.sequence_number)
+
 
             self.sequence_number += 1
 
@@ -113,6 +125,7 @@ class Streamer:
 
             if self.expected_sequence in self.recv_buffer:
                 data = self.recv_buffer.pop(self.expected_sequence)
+                print("Raw data received:", data)
                 self.expected_sequence += 1
 
                 # keep getting packets that are in order
