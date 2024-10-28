@@ -31,9 +31,14 @@ class Streamer:
             try:
                 received, _ = self.socket.recvfrom()
 
+                # catch really busted packets
+                if len(received) < 9:
+                    print("Received packet with insufficient length, ignoring.")
+                    continue
+
                 # note that first byte is ACK flag
                 ack_flag = received[0]
-                print("ACK flag:", ack_flag)
+                # print("ACK flag:", ack_flag)
                 seq_num = struct.unpack("Q", received[1:9])[0]
                 data = received[9:]
 
@@ -48,8 +53,8 @@ class Streamer:
                         self.recv_buffer[seq_num] = data
 
             except Exception as e:
-                print("listener died!")
-                print(e)
+                print("Listener died 'cause of this! ", e)
+
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -64,13 +69,18 @@ class Streamer:
             # add a flag to denote ACK: 1 for yes
             header = struct.pack("BQ", 0, self.sequence_number) #Byte for ACK flag + 8B unsigned long long
             packet = header + chunk
-
+            retry_count = 0
+            max_retries = 10
             self.ack_received = False
 
-            while not self.ack_received:
+            while not self.ack_received and retry_count < max_retries:
                 # keep trying to send
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
                 time.sleep(0.01)
+                retry_count += 1
+
+            if not self.ack_received:
+                print("Failed to receive ACK for packet # ", self.sequence_number)
 
             self.sequence_number += 1
 
@@ -78,7 +88,6 @@ class Streamer:
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         # your code goes here!  The code below should be changed!
-
         while True:
             # the receiving and updating buffer are handled by self.listener
             """
@@ -105,6 +114,12 @@ class Streamer:
             if self.expected_sequence in self.recv_buffer:
                 data = self.recv_buffer.pop(self.expected_sequence)
                 self.expected_sequence += 1
+
+                # keep getting packets that are in order
+                while self.expected_sequence in self.recv_buffer:
+                    data += self.recv_buffer.pop(self.expected_sequence)
+                    self.expected_sequence += 1
+
                 return data
 
 
