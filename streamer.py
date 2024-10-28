@@ -37,30 +37,43 @@ class Streamer:
                     continue
 
                 # note that first byte is ACK flag
-                ack_flag = received[0]
+                # ack_flag = received[0]
                 # print("ACK flag type:", type(ack_flag))
-                seq_num = struct.unpack("Q", received[1:9])[0]
+                # seq_num = struct.unpack("Q", received[1:9])[0]
+                # print("RECEIVED :9",received[:9])
+                ack_flag, seq_num = struct.unpack("BQ", received[:16])
+                # print("GOT SEQ # ", seq_num)
                 data = received[9:].strip(b'\x00')
                 # print("listener data:", data)
+                print("rec'd ACK flag:", ack_flag, "Seq number:", seq_num, "Data:", data)
 
                 # if it's an ack, check if it matches with the previous sent seq number
                 if ack_flag == 1:
-                    if seq_num == self.sequence_number - 1:
+                    print("Received ACK for sequence number:", seq_num)
+                    if seq_num == self.sequence_number:
                         self.ack_received = True
+                        # print("ACK matches the current sequence.")
+                    else:
+                        print(f"Received ACK for unexpected sequence number {seq_num}. Current expected: {self.sequence_number}")
+
 
                 # otherwise, it's data so add to buffer
                 else:
-                    print("the received thing is data, not an ack")
-                    print("sequence number received:", seq_num)
-                    print("expected sequence number:", self.expected_sequence)
-                    print("self.sequence num:", self.sequence_number)
-                    if seq_num >= self.expected_sequence:
+                    print("Received data packet with sequence number:", seq_num)
+                    print("Expecting data packet with sequence number:", self.expected_sequence)
+                    if seq_num < self.expected_sequence:
+                        # print(f"Duplicate packet with sequence number: {seq_num}. Ignoring.")
+                        continue
+                    elif seq_num == self.expected_sequence:
                         self.recv_buffer[seq_num] = data
-
-                        # send ACK
                         ack_packet = struct.pack("BQ", 1, seq_num)
-                        print("ack_packet", ack_packet)
+                        print("Sending ACK for sequence number:", seq_num)
                         self.socket.sendto(ack_packet, addr)
+                        self.expected_sequence += 1
+                        # print("Incremented expected in listener to", self.expected_sequence )
+                    else:
+                        self.recv_buffer[seq_num] = data
+                        # print(f"Buffered out-of-order packet with sequence number: {seq_num}")
 
             except Exception as e:
                 print("Listener died 'cause of this! ", e)
@@ -75,26 +88,25 @@ class Streamer:
 
         for i in range(0, len(data_bytes), chunk_size):
             chunk = data_bytes[i: i + chunk_size]
-
             # add a flag to denote ACK: 1 for yes
             header = struct.pack("BQ", 0, self.sequence_number) #Byte for ACK flag + 8B unsigned long long
-            packet = header + chunk.strip(b'\x00')
+            packet = header + chunk
             retry_count = 0
             max_retries = 10
             self.ack_received = False
 
             while not self.ack_received and retry_count < max_retries:
                 # keep trying to send
-                print("retrying sending packet (waiting for ACK)")
+                # print("retrying sending packet (waiting for ACK)")
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                time.sleep(0.25)
+                time.sleep(0.3)
                 retry_count += 1
 
-            if not self.ack_received:
-                print("Failed to receive ACK for packet # ", self.sequence_number)
-
-
-            self.sequence_number += 1
+            if self.ack_received:
+                print(f"ACK confirmed for packet {self.sequence_number}")
+                self.sequence_number += 1  # Increment after receiving ACK
+            else:
+                print("Failed to receive ACK for packet", self.sequence_number)
 
 
     def recv(self) -> bytes:
@@ -123,15 +135,16 @@ class Streamer:
                 self.recv_buffer[seq_num] = data
             """
 
-            if self.expected_sequence in self.recv_buffer:
+            while self.expected_sequence in self.recv_buffer:
                 data = self.recv_buffer.pop(self.expected_sequence)
-                print("Raw data received:", data)
-                self.expected_sequence += 1
+                # print("Raw data received from popping buffer:", data)
+                # self.expected_sequence += 1
+                # print("Incrementing expected in recv to", self.expected_sequence)
 
                 # keep getting packets that are in order
-                while self.expected_sequence in self.recv_buffer:
-                    data += self.recv_buffer.pop(self.expected_sequence)
-                    self.expected_sequence += 1
+                # while self.expected_sequence in self.recv_buffer:
+                #     data += self.recv_buffer.pop(self.expected_sequence)
+                #     self.expected_sequence += 1
 
                 return data
 
