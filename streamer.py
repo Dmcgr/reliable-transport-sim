@@ -37,10 +37,6 @@ class Streamer:
                     continue
 
                 # note that first byte is ACK flag
-                # ack_flag = received[0]
-                # print("ACK flag type:", type(ack_flag))
-                # seq_num = struct.unpack("Q", received[1:9])[0]
-                # print("RECEIVED :9",received[:9])
                 ack_flag, seq_num = struct.unpack("!BQ", received[:9])
                 # print("GOT SEQ # ", seq_num)
                 data = received[9:].strip(b'\x00')
@@ -104,11 +100,21 @@ class Streamer:
                 time.sleep(0.01)
                 retry_count += 1
 
+                # wait for ack
+                start_time = time.time()
+                while time.time() - start_time < 0.25:  # ACK timeout of 0.25 seconds
+                    print(f"ACK confirmed for packet {self.sequence_number}")
+                    if self.ack_received:
+                        break
+
             if self.ack_received:
-                # print(f"ACK confirmed for packet {self.sequence_number}")
+                print(f"ACK confirmed for packet {self.sequence_number}")
                 self.sequence_number += 1  # Increment after receiving ACK
             # else:
             #     print("Failed to receive ACK for packet", self.sequence_number)
+            if not self.ack_received:
+                print(f"ACK timeout for packet {self.sequence_number}. Retrying...")
+                self.ack_received = False  # Reset for next retry
 
 
     def recv(self) -> bytes:
@@ -156,4 +162,32 @@ class Streamer:
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
         self.closed = True
+
+        # wait for acks to send all data
+        while self.sequence_number > self.expected_sequence:
+            time.sleep(0.01)
+
+        # send FIN
+        fin_packet = struct.pack("!BQ", 2, self.sequence_number)  # ACK flag 2 for FIN
+        retry_count = 0
+        while retry_count < 5:
+            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
+            time.sleep(0.01)
+            retry_count += 1
+
+        # wait for ack of FIN packet
+        fin_ack_received = False
+        start_time = time.time()
+        while time.time() - start_time < 0.25:
+            received, addr = self.socket.recvfrom()
+            ack_flag, seq_num = struct.unpack("!BQ", received[:9])
+            if ack_flag == 1 and seq_num == self.sequence_number:
+                fin_ack_received = True
+                break
+
+        while not fin_ack_received:
+            time.sleep(0.01)
+
+        # Grace period before stopping the listener
+        time.sleep(2)
         self.socket.stoprecv()
