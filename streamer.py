@@ -1,198 +1,135 @@
-# do not import anything else from loss_socket besides LossyUDP
-from concurrent.futures.thread import ThreadPoolExecutor
-
+from concurrent.futures import ThreadPoolExecutor
 from lossy_socket import LossyUDP
-# do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
-
 import struct
 import time
+import hashlib
+from threading import Lock, Event, Timer
 
 
 class Streamer:
-    def __init__(self, dst_ip, dst_port,
-                 src_ip=INADDR_ANY, src_port=0):
-        """Default values listen on all network interfaces, chooses a random source port,
-           and does not introduce any simulated packet loss."""
+    seq_num = 0
+    ack_num = 0
+    header_len = 9
+    hash_len = 16
+    max_data_len = 1472 - header_len - hash_len
+    receive_buffer = {}
+    ack_buffer = {}
+
+    def __init__(self, dst_ip, dst_port, src_ip=INADDR_ANY, src_port=0):
         self.socket = LossyUDP()
         self.socket.bind((src_ip, src_port))
         self.dst_ip = dst_ip
         self.dst_port = dst_port
-        self.sequence_number = 0 # keep track of the sequence numbers
-        self.expected_sequence = 0 # keep track of sequence of received
-        self.recv_buffer = {} # buffer for out of order
-        self.closed = False # if listener should stop
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.executor.submit(self.listener)
-        self.ack_received = False
+        self.closed = False
+        self.ack_buffer = {}
+        self.send_buffer = {}
+        self.receive_buffer = {}
+        self.seq_num = 0
+        self.ack_num = 0
+        self.base = 0
+        self.window_size = 5
+        self.ack_event = Event()
+        self.lock = Lock()
+        self.ack_timeout = 0.5
+        self.retransmission_timer = None
+        self.fin_received = False
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(self.listener)
+
+    def send(self, data_bytes: bytes) -> None:
+        data_chunks = [data_bytes[i:i + self.max_data_len] for i in range(0, len(data_bytes), self.max_data_len)]
+
+        for chunk in data_chunks:
+            with self.lock:
+                while self.seq_num >= self.base + self.window_size:
+                    self.ack_event.wait(timeout=self.ack_timeout)
+                    self.ack_event.clear()
+
+                packet = struct.pack("!BQ", 0, self.seq_num) + chunk
+                final_packet = self.pack_checksum(packet)
+                self.send_buffer[self.seq_num] = final_packet
+
+            self.socket.sendto(final_packet, (self.dst_ip, self.dst_port))
+
+            with self.lock:
+                if self.seq_num == self.base:
+                    if self.retransmission_timer is not None:
+                        self.retransmission_timer.cancel()
+                    self.retransmission_timer = Timer(self.ack_timeout, self.check_retransmission)
+                    self.retransmission_timer.start()
+
+                self.seq_num += 1
+
+        with self.lock:
+            while self.base < self.seq_num:
+                self.ack_event.wait(timeout=self.ack_timeout)
+                self.ack_event.clear()
+
+    def recv(self):
+        while True:
+            while self.ack_num in self.receive_buffer:
+                data = self.receive_buffer.pop(self.ack_num)
+                self.ack_num += 1
+                return data
 
     def listener(self):
         while not self.closed:
             try:
-                received, addr = self.socket.recvfrom()
-
-                # catch really busted packets
-                if len(received) < 9:
-                    print("Received packet with insufficient length, ignoring.")
-                    continue
-
-                # note that first byte is ACK flag
-                ack_flag, seq_num = struct.unpack("!BQ", received[:9])
-                data = received[9:].strip(b'\x00')
-
-
-                # if it's an ack, check if it matches with the previous sent seq number
-                if ack_flag == 1:
-                    print("we got an ack flag")
-                    if seq_num == self.sequence_number:
-                        self.ack_received = True
-                    else:
-                        print(f"Received ACK for packet #{seq_num}, but expected #{self.expected_sequence}.")
-
-                # is the FIN packet
-                if ack_flag == 2:
-                    fin_ack_packet = struct.pack("!BQ", 1, seq_num)
-                    self.socket.sendto(fin_ack_packet, addr)
-                    self.closed = True
-                    print("sent the fin ack")
-                    break
-
-                # otherwise, it's data so add to buffer
-                else:
-                    print("sequence num from packet:", seq_num, "; expected:", self.expected_sequence, "; sequence:", self.sequence_number)
-                    if seq_num < self.expected_sequence: # old/duplicate packet, skip
-                        print("old/duplicate packet")
-                        # ack_packet = struct.pack("!BQ", 1, seq_num)
-                        # self.socket.sendto(ack_packet, addr)
-                        continue # was previously continue
-                    elif seq_num == self.expected_sequence:
-                        print(f"Processing packet #{seq_num}.")
-                        # self.recv_buffer[seq_num] = data
-                        ack_packet = struct.pack("!BQ", 1, seq_num)
-                        self.socket.sendto(ack_packet, addr)
-                        print("we successfully received, sent ack, and processed the proper packet expected (before inc):",
-                              self.expected_sequence)
-                        self.expected_sequence += 1
-
-                    else:
-                        # Out-of-order packet, add to buffer
-                        self.recv_buffer[seq_num] = data
-                        print(f"Buffered packet #{seq_num}.")
-                        ack_packet = struct.pack("!BQ", 1, seq_num)
-                        self.socket.sendto(ack_packet, addr)
-                        # self.expected_sequence += 1
-
+                data, addr = self.socket.recvfrom()
+                if data:
+                    received_checksum = data[:self.hash_len]
+                    received_packet = data[self.hash_len:]
+                    if hashlib.md5(received_packet).digest() == received_checksum:
+                        packet_type, seq_num = struct.unpack("!BQ", received_packet[:self.header_len])
+                        if packet_type == 0:
+                            chunk = received_packet[self.header_len:]
+                            self.receive_buffer[seq_num] = chunk
+                            self.send_ack(seq_num, addr)
+                        elif packet_type == 1:
+                            if seq_num >= self.base:
+                                self.base = seq_num + 1
+                                self.ack_event.set()
+                                if self.retransmission_timer is not None:
+                                    self.retransmission_timer.cancel()
+                                    self.retransmission_timer = None
+                        elif packet_type == 2:
+                            self.fin_received = True
+                            self.send_ack(seq_num, addr)
 
             except Exception as e:
-                print("Listener died 'cause of this! ", e)
+                print("Listener encountered an error:", e)
+                self.closed = True
 
+    def send_ack(self, seq_num, addr):
+        ack_packet = struct.pack("!BQ", 1, seq_num)
+        final_packet = self.pack_checksum(ack_packet)
+        self.socket.sendto(final_packet, addr)
 
-    def send(self, data_bytes: bytes) -> None:
-        """Note that data_bytes can be larger than one packet."""
-        # Your code goes here!  The code below should be changed!
+    def pack_checksum(self, packet):
+        return hashlib.md5(packet).digest() + packet
 
-        # making the chunks 1024 bytes
-        chunk_size = 1025
-
-        for i in range(0, len(data_bytes), chunk_size):
-            chunk = data_bytes[i: i + chunk_size]
-            header = struct.pack("!BQ", 0, self.sequence_number)  # ACK flag + sequence number
-            packet = header + chunk
-            max_retries = 10
-            retry_count = 0
-            self.ack_received = False
-
-            while not self.ack_received and retry_count < max_retries:
-                print(f"Sending packet #{self.sequence_number}; waiting for ACK...")
+    def check_retransmission(self):
+        if self.base < self.seq_num:
+            for seq_num in range(self.base, self.seq_num):
+                packet = self.send_buffer[seq_num]
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                retry_count += 1
-                time.sleep(0.03)
 
-                # Wait for ACK with a timeout for each retry
-                start_time = time.time()
-                while time.time() - start_time < 0.25:
-                    if self.ack_received:  # Exit if ACK confirmed
-                        break
-                    # else:
-                    #     print(f"ACK timeout for packet #{self.sequence_number}. Retrying...")
-
-            # maybe this should be indented
-            if self.ack_received:
-                print(f"ACK confirmed for packet #{self.sequence_number}")
-                self.sequence_number += 1  # Received, go next packet
-                # self.expected_sequence += 1
-                print("expected:", self.expected_sequence, "; sequence:", self.sequence_number)
-                break
-
-            # Max retries, print and go next packet
-            if not self.ack_received:
-                print(
-                    f"Failed to receive ACK for packet #{self.sequence_number} after {max_retries} retries. Skipping packet.")
-                self.sequence_number += 1  # Move on even if ACK not received
-                # self.expected_sequence += 1
-                print("expected:", self.expected_sequence, "; sequence:", self.sequence_number)
-
-
-    def recv(self) -> bytes:
-        """Blocks (waits) if no data is ready to be read from the connection."""
-        # your code goes here!  The code below should be changed!
-        data_list = []
-        while True:
-            # Only process the buffer if it contains the exact expected sequence packet
-            if self.expected_sequence in self.recv_buffer:
-                # Retrieve and remove the packet from the buffer
-                data = self.recv_buffer.pop(self.expected_sequence)
-                print(f"Got packet #{self.expected_sequence}.")
-                self.expected_sequence += 1  # Increment to the next expected sequence
-                return data
-            else:
-                # Wait if the exact expected sequence packet is not yet available
-                time.sleep(0.01)
-
+            if self.retransmission_timer is not None:
+                self.retransmission_timer.cancel()
+            self.retransmission_timer = Timer(self.ack_timeout, self.check_retransmission)
+            self.retransmission_timer.start()
+        else:
+            if self.retransmission_timer is not None:
+                self.retransmission_timer.cancel()
+                self.retransmission_timer = None
 
     def close(self) -> None:
-        """Cleans up. It should block (wait) until the Streamer is done with all
-           the necessary ACKs and retransmissions"""
-        # your code goes here, especially after you add ACKs and retransmissions.
+        fin_seq_num = self.seq_num
+        self.seq_num += 1
+        fin_packet = struct.pack("!BQ", 2, fin_seq_num)
+        fin_packet_checksum = self.pack_checksum(fin_packet)
+        self.socket.sendto(fin_packet_checksum, (self.dst_ip, self.dst_port))
+        time.sleep(2)
         self.closed = True
-        print("Closing...")
-        # Ensure all data is acknowledged
-        while not self.ack_received or self.sequence_number > self.expected_sequence:
-            time.sleep(0.1)  # Allow time for any final ACKs
-
-        print("Sending FIN packet...")
-        fin_packet = struct.pack("!BQ", 2, self.sequence_number)  # ACK flag 2 for FIN
-        fin_ack_received = False
-        retry_count = 0
-        max_fin_retries = 10
-
-        # Send FIN and wait for acknowledgment
-        while not fin_ack_received and retry_count < max_fin_retries:
-            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
-            print("FIN packet sent; awaiting ack...")
-            time.sleep(0.1)  # Small delay to wait for possible ACK
-
-            try:
-                received, addr = self.socket.recvfrom()
-                ack_flag, seq_num = struct.unpack("!BQ", received[:9])
-
-                # Check if it's an ACK for the FIN packet
-                if ack_flag == 1 and seq_num == self.sequence_number:
-                    fin_ack_received = True
-                    print("FIN acknowledgment received.")
-            except self.socket.timeout:
-                print("Socket timed out waiting for FIN acknowledgment. Retrying...")
-            except OSError as e:
-                print(f"Socket error occurred: {e}. Retrying...")
-
-            retry_count += 1
-
-        # Final check and cleanup
-        if fin_ack_received:
-            print("Closing listener after successful FIN acknowledgment...")
-        else:
-            print("Failed to receive FIN acknowledgment after maximum retries. Proceeding with closure.")
-
-        # Give a grace period before stopping the listener
-        time.sleep(1)
         self.socket.stoprecv()
