@@ -46,8 +46,8 @@ class Streamer:
                 data = received[9:].strip(b'\x00')
                 # print("listener data:", data)
                 # print("rec'd ACK flag:", ack_flag, "Seq number:", seq_num, "Data:", data)
-                print(f"Received data packet with length: {len(data)}")
-                print(f"ACK flag: {ack_flag}, Seq number: {self.sequence_number}, Data: {data}")
+                # print(f"Received data packet with length: {len(data)}")
+                # print(f"ACK flag: {ack_flag}, Seq number: {self.sequence_number}, Data: {data}")
 
                 # if it's an ack, check if it matches with the previous sent seq number
                 if ack_flag == 1:
@@ -86,7 +86,7 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
 
         # making the chunks 1024 bytes
-        chunk_size = 1024
+        chunk_size = 1025
 
         for i in range(0, len(data_bytes), chunk_size):
             chunk = data_bytes[i: i + chunk_size]
@@ -94,14 +94,14 @@ class Streamer:
             header = struct.pack("!BQ", 0, self.sequence_number) #Byte for ACK flag + 8B unsigned long long
             packet = header + chunk
             retry_count = 0
-            max_retries = 10
+            max_retries = 20
             self.ack_received = False
 
             while not self.ack_received and retry_count < max_retries:
                 # keep trying to send
                 # print("retrying sending packet (waiting for ACK)")
                 self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-                time.sleep(0.3)
+                time.sleep(0.01)
                 retry_count += 1
 
             if self.ack_received:
